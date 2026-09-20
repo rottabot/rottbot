@@ -16,9 +16,9 @@ dp = Dispatcher()
 
 class AnswerState(StatesGroup):
     waiting_for_reply = State()
+    waiting_for_anon_text = State()
 
 # Хранилища в памяти
-ACTIVE_MESSAGES = {}    # msg_id -> {"sender_id": int, "recipient_id": int}
 ACTIVE_CHATS = {}       # owner_id -> target_user_id (для ответа)
 BLACKLIST = {}          # recipient_id: set(blocked_user_ids)
 
@@ -36,28 +36,29 @@ async def cmd_start(message: Message, state: FSMContext):
     args = message.text.split(maxsplit=1)
     if len(args) > 1 and args[1].startswith("id_"):
         recipient_id = int(args[1].replace("id_", ""))
+        # Сохраняем получателя и переводим в состояние ввода анонимного сообщения
         await state.update_data(recipient_id=recipient_id)
+        await state.set_state(AnswerState.waiting_for_anon_text)
         await message.answer("Введите текст анонимного сообщения:", reply_markup=get_main_keyboard())
     else:
         my_link = f"https://t.me/{(await bot.get_me()).username}?start=id_{message.from_user.id}"
         await message.answer(f"Привет.\nВот твоя ссылка для анонимных вопросов:\n{my_link}", reply_markup=get_main_keyboard())
+        await state.clear()
 
 # Обработка нажатия на кнопку "Профиль" снизу
 @dp.message(F.text == "Профиль")
-async def cmd_profile(message: Message):
+async def cmd_profile(message: Message, state: FSMContext):
+    await state.clear()
     user_id = message.from_user.id
     my_link = f"https://t.me/{(await bot.get_me()).username}?start=id_{user_id}"
     
-    # Формируем список заблокированных
     blocked_users = BLACKLIST.get(user_id, set())
-    
     text = f"Твой профиль.\n\nТвоя ссылка для анонимных вопросов:\n{my_link}\n\nЧерный список:"
     
     if not blocked_users:
         text += "\nСписок пуст."
         await message.answer(text, reply_markup=get_main_keyboard())
     else:
-        # Создаем инлайн-кнопки для разблокировки каждого пользователя
         inline_keyboard = []
         for b_id in blocked_users:
             inline_keyboard.append([
@@ -79,14 +80,16 @@ async def process_unblock(callback: CallbackQuery):
         await callback.message.edit_text("Пользователь не найден в черном списке.")
     await callback.answer()
 
-@dp.message(F.text & ~F.text.startswith("/") & (F.text != "Профиль"))
+# Прием анонимного сообщения, когда пользователь перешел по ссылке
+@dp.message(AnswerState.waiting_for_anon_text, F.text & (F.text != "Профиль"))
 async def send_anon_message(message: Message, state: FSMContext):
     data = await state.get_data()
     recipient_id = data.get("recipient_id")
     sender_id = message.from_user.id
 
     if not recipient_id:
-        await message.answer("Сначала перейдите по ссылке для отправки анонимного сообщения.", reply_markup=get_main_keyboard())
+        await message.answer("Отправьте свою ссылку другу, чтобы он мог написать вам анонимно.", reply_markup=get_main_keyboard())
+        await state.clear()
         return
 
     # Проверка черного списка
@@ -106,17 +109,11 @@ async def send_anon_message(message: Message, state: FSMContext):
         ]
     ])
     
-    sent_msg = await bot.send_message(
+    await bot.send_message(
         chat_id=recipient_id,
         text=f"Новое анонимное сообщение:\n\n{message.text}",
         reply_markup=keyboard
     )
-
-    # Сохраняем привязку ID отправителя к ID сообщения у получателя
-    ACTIVE_MESSAGES[sent_msg.message_id] = {
-        "sender_id": sender_id,
-        "recipient_id": recipient_id
-    }
 
     await message.answer("Ваше сообщение успешно отправлено анонимно.", reply_markup=get_main_keyboard())
     await state.clear()
@@ -131,7 +128,7 @@ async def process_reply_button(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(AnswerState.waiting_for_reply)
 
-@dp.message(AnswerState.waiting_for_reply, F.text)
+@dp.message(AnswerState.waiting_for_reply, F.text & (F.text != "Профиль"))
 async def send_reply_to_anon(message: Message, state: FSMContext):
     owner_id = message.from_user.id
     target_user_id = ACTIVE_CHATS.get(owner_id)
@@ -151,6 +148,16 @@ async def send_reply_to_anon(message: Message, state: FSMContext):
     else:
         await message.answer("Ошибка сессии. Попробуйте нажать кнопку Ответить заново.", reply_markup=get_main_keyboard())
         await state.clear()
+
+# Общий обработчик текста, если человек просто пишет в чате без ссылки
+@dp.message(F.text & (F.text != "Профиль"))
+async def default_text_handler(message: Message):
+    my_link = f"https://t.me/{(await bot.get_me()).username}?start=id_{message.from_user.id}"
+    await message.answer(
+        f"Чтобы отправить кому-то анонимное сообщение, перейдите по его персональной ссылке.\n\n"
+        f"А вот ваша ссылка для получения сообщений:\n{my_link}",
+        reply_markup=get_main_keyboard()
+    )
 
 # --- КНОПКА: УЗНАТЬ АВТОРА ---
 @dp.callback_query(F.data.startswith("reveal_"))
